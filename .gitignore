@@ -1,0 +1,38 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+myenv/
+venv/
+env/
+ENV/
+*.egg-info/
+
+# Django specific
+*.log
+*.pot
+media/
+static/
+local_settings.py
+
+
+# System files
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# OS generated files #
+######################
+.DS_Store
+.DS_Store?
+._*
+*.swp
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
