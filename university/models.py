@@ -36,8 +36,8 @@ class Faculty(models.Model):
         ('INST', 'Instructor'),
     ]
 
-    user = models.OneToOneField(User, on_delete=models.CASCADE)
-    department = models.ForeignKey(Department, on_delete=models.CASCADE)
+    user = models.OneToOneField(User, on_delete=models.CASCADE, blank=True, null=True)
+    department = models.ForeignKey(Department, on_delete=models.CASCADE, blank=True, null=True)
     rank = models.CharField(max_length=4, choices=RANK_CHOICES)
     office_location = models.CharField(max_length=50)
     office_hours = models.CharField(max_length=100, blank=True)
@@ -330,3 +330,4 @@ class Room(models.Model):
 
     class Meta:
         unique_together = ('building', 'room_number')
+

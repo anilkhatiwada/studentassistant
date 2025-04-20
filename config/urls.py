@@ -2,6 +2,7 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from university import views
 from ai.views import university_assistant
+from django.contrib import admin
 
 # Create a router and register our viewsets with it
 router = DefaultRouter()
@@ -23,6 +24,9 @@ router.register(r'rooms', views.RoomViewSet)
 
 # Additional custom URLs that don't fit the ViewSet pattern
 urlpatterns = [
+
+    # Admin site
+    path('admin/', admin.site.urls),
     # API root
     path('', include(router.urls)),
     
