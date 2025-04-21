@@ -1,6 +1,7 @@
 import json
 import re
 from datetime import datetime, timedelta
+from urllib.parse import quote_plus
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
@@ -11,6 +12,7 @@ from django.utils import timezone
 from django.core.cache import cache
 from difflib import SequenceMatcher
 from django.contrib.auth.models import User
+from django.db.models import Case, When, Value, IntegerField
 
 # Import your models - adjust this import according to your project structure
 from university.models import (
@@ -31,118 +33,80 @@ def similar(a, b):
     """Calculate text similarity between two strings"""
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-def search_knowledge_base(user_query, context=None):
-    """
-    Enhanced knowledge base search with AI-powered relevance matching
-    Features:
-    1. Caching for performance
-    2. Multiple fallback strategies
-    3. Better error handling
-    4. Optimized AI prompt
-    5. Configurable thresholds
-    """
-    # Configuration
-    MIN_RELEVANCE_SCORE = 40  # Lowered threshold to capture more potential matches
-    MAX_RESULTS = 3
-    CACHE_TIMEOUT = 3600  # 1 hour cache
-    
-    # Try cache first if enabled
-    cache_key = f"kb_search_{user_query.lower().strip()}"
-    cached_results = cache.get(cache_key)
-    if cached_results:
-        return cached_results
-    
-    # Strategy 1: Semantic Search (Postgres vector search)
-    try:
-        vector = SearchVector('question', weight='A') + SearchVector('answer', weight='B')
-        query = SearchQuery(user_query)
-        
-        semantic_results = KnowledgeBaseEntry.objects.annotate(
-            search=vector,
-            rank=SearchRank(vector, query)
-        ).filter(search=query).order_by('-rank')[:MAX_RESULTS*2]  # Get extra for filtering
-        
-        if semantic_results.exists():
-            # Cache and return results
-            cache.set(cache_key, list(semantic_results), CACHE_TIMEOUT)
-            return semantic_results
-    except Exception as e:
-        pass  # Silently fall through to next strategy
-    
-    # Strategy 2: AI-Powered Matching
+def extract_keywords_with_gemini(user_query):
+    """Use Gemini to extract important keywords from the user query"""
     try:
         model = genai.GenerativeModel("gemini-1.5-flash")
-        
-        # Get a representative sample if KB is large
-        all_entries = KnowledgeBaseEntry.objects.all()
-        if all_entries.count() > 100:
-            all_entries = all_entries.order_by('-last_accessed')[:100]  # Get most recently used
-        
-        # Optimized prompt for better matching
         prompt = f"""
-        Analyze this university query and match to knowledge base entries.
-        Return JSON with: id (1-based index), relevance_score (0-100), match_reason.
-        Only include entries with score >= {MIN_RELEVANCE_SCORE}.
-        Prioritize: 1) Direct question matches 2) Answer content 3) Conceptual similarity.
-        
-        Query: "{user_query}"
-        
-        Knowledge Base:
-        {chr(10).join(f"{i+1}. Q: {e.question[:200]}{'...' if len(e.question)>200 else ''}{chr(10)}A: {e.answer[:200]}{'...' if len(e.answer)>200 else ''}" 
-                      for i, e in enumerate(all_entries))}
-        """
-        
-        response = model.generate_content(prompt)
-        matches = parse_gemini_response(response.text)
-        
-        if matches and isinstance(matches, list):
-            valid_matches = [m for m in matches if m.get('relevance_score', 0) >= MIN_RELEVANCE_SCORE]
-            valid_matches.sort(key=lambda x: x['relevance_score'], reverse=True)
-            
-            if valid_matches:
-                results = []
-                for match in valid_matches[:MAX_RESULTS]:
-                    try:
-                        entry = all_entries[match['id']-1]
-                        entry.last_accessed = timezone.now()  # Track usage
-                        entry.save()
-                        results.append(entry)
-                    except IndexError:
-                        continue
-                
-                if results:
-                    cache.set(cache_key, results, CACHE_TIMEOUT)
-                    return results
-    except Exception as e:
-        print(f"AI matching error: {e}")  # Consider proper logging
-    
-    # Strategy 3: Hybrid Fallback Search
-    try:
-        # Split query into meaningful words
-        words = [word for word in re.findall(r'\w+', user_query.lower()) if len(word) > 3]
-        
-        if words:
-            # Create a Q object for each word
-            queries = [Q(question__icontains=word) | Q(answer__icontains=word) for word in words]
-            
-            # Start with the first query
-            combined_query = queries.pop()
-            
-            # OR the remaining queries
-            for q in queries:
-                combined_query |= q
-            
-            fallback_results = KnowledgeBaseEntry.objects.filter(combined_query)[:MAX_RESULTS]
-            
-            if fallback_results.exists():
-                cache.set(cache_key, list(fallback_results), CACHE_TIMEOUT)
-                return fallback_results
-    except Exception as e:
-        pass
-    
-    # Final fallback: Empty result
-    return KnowledgeBaseEntry.objects.none()
+        Extract the 3-5 most important keywords from this query that would be useful for database searching.
+        Return ONLY a JSON array of keywords in order of importance.
 
+        Query: "{user_query}"
+
+        Example Response: ["tuition fees", "payment deadline", "computer science"]
+        """
+
+        response = model.generate_content(prompt)
+
+        # Safely extract JSON array from Gemini output
+        content = response.text.strip()
+        if content.startswith("```json"):
+            content = content.replace("```json", "").replace("```", "").strip()
+
+        keywords = json.loads(content)
+
+        print(f"Gemini keywords: {keywords}")
+        return [kw.lower().strip() for kw in keywords if len(kw) > 2]
+
+    except Exception as e:
+        print(f"Gemini keyword extraction failed: {e}")
+        # Fallback: extract words > 3 chars
+        return [word for word in user_query.lower().split() if len(word) > 3]
+
+
+def search_knowledge_base(user_query, context=None):
+    """
+    Enhanced search through KnowledgeBaseEntry table with:
+    - Gemini keyword extraction
+    - Multi-strategy search
+    - Intelligent ranking
+    """
+    query = user_query.strip()
+    if not query:
+        return KnowledgeBaseEntry.objects.none()
+
+    # Safe cache key using quote_plus to avoid Memcached issues
+    safe_query = quote_plus(query.lower())
+    cache_key = f"kb_search_{safe_query}"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
+    keywords = extract_keywords_with_gemini(query)
+    queries = [Q(question__iexact=query), Q(answer__iexact=query)]
+
+    for keyword in keywords:
+        queries.append(Q(question__icontains=keyword))
+        queries.append(Q(answer__icontains=keyword))
+
+    # Combine all with OR
+    combined_query = queries.pop()
+    for q in queries:
+        combined_query |= q
+
+    results = KnowledgeBaseEntry.objects.filter(combined_query).annotate(
+    relevance=Case(
+        When(question__iexact=query, then=Value(100)),
+        When(answer__iexact=query, then=Value(90)),
+        When(question__icontains=query, then=Value(80)),
+        When(answer__icontains=query, then=Value(70)),
+        default=Value(50),
+        output_field=IntegerField()
+    )
+).order_by('-relevance')[:5]
+
+    cache.set(cache_key, results, 3600)
+    return results
 def get_client_ip(request):
     """Get the client's IP address from the request."""
     x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
@@ -706,7 +670,8 @@ def university_assistant(request):
         
         # Step 3: Generate final response
         response_prompt = f"""
-You are a helpful assistant for Troy University in Alabama. The user asked: "{user_query}"
+You are a helpful assistant for Troy University in Alabama made by *Anil Khatiwada*
+,*Shankar Bhattarai*, *Bishal Awasthi* . The user asked: "{user_query}"
 
 Context: {response_template}
 
@@ -715,11 +680,12 @@ Relevant Data (in JSON format):
 
 Please generate a concise, friendly response that:
 1. First try to directly answer the user's question using the provided data
-2. If showing knowledge base results, indicate they're from our knowledge base
-3. For Troy University-specific information, focus on key aspects when relevant
-4. When appropriate, include that you're "Troy University's AI assistant"
-5. If appropriate, suggest contacting specific offices or visiting troy.edu
-6. Keep the response under 3-4 sentences if possible
+2. For Troy University-specific information, focus on key aspects when relevant
+3. When appropriate, include that you're "Troy University's AI assistant"
+4. If appropriate, suggest contacting specific offices or visiting troy.edu
+5. Keep the response under 3-4 sentences if possible
+6. don't say i don't have infromation or Based on the available data, but say far as i have information......because i am in development stage 
+7. if user start in aother language then respond in that language
 
 Respond with just the plain text answer.
         """
