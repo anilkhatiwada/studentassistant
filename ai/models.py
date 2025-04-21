@@ -20,13 +20,4 @@ class KnowledgeBaseEntry(models.Model):
     def save(self, *args, **kwargs):
         # Auto-generate search terms if not provided
         if not hasattr(self, 'search_terms') or not self.search_terms:
-            import re
-            from nltk.corpus import stopwords
-            from nltk.tokenize import word_tokenize
-            
-            # Simple keyword extraction
-            words = word_tokenize(self.question.lower())
-            stop_words = set(stopwords.words('english'))
-            keywords = [word for word in words if word.isalnum() and word not in stop_words]
-            self.search_terms = ' '.join(set(keywords))
-        super().save(*args, **kwargs)
+            super().save(*args, **kwargs)

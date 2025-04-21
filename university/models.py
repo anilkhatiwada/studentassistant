@@ -147,7 +147,7 @@ class Course(models.Model):
     code = models.CharField(max_length=10, unique=True)
     title = models.CharField(max_length=200)
     description = models.TextField()
-    department = models.ForeignKey(Department, on_delete=models.CASCADE)
+    department = models.ForeignKey(Department, on_delete=models.CASCADE, blank=True, null=True)
     credits = models.PositiveSmallIntegerField(default=3)
     level = models.PositiveSmallIntegerField(choices=LEVEL_CHOICES)
     prerequisites = models.ManyToManyField('self', symmetrical=False, blank=True)

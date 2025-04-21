@@ -1,23 +1,147 @@
 import json
+import re
 from datetime import datetime, timedelta
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
 import google.generativeai as genai
 from django.db.models import Q
+from django.contrib.postgres.search import SearchVector, SearchQuery, SearchRank
+from django.utils import timezone
+from django.core.cache import cache
+from difflib import SequenceMatcher
+from django.contrib.auth.models import User
+
+# Import your models - adjust this import according to your project structure
 from university.models import (
     Department, Faculty, Student, AcademicProgram, 
     Course, ProgramCourse, Semester, CourseOffering,
-    Enrollment, Transcript, Announcement, Building, Room
+    Enrollment, Transcript, Announcement, Building, Room,
+    
 )
-from django.contrib.auth.models import User
-from django.core.cache import cache
+from .models import KnowledgeBaseEntry
 
 # Configure Gemini
 genai.configure(api_key="AIzaSyDP3DaGFyycm-QxCg5muMgEQmd4CZySlyI")
 
 # Context storage duration in seconds (60 minutes)
 CONTEXT_DURATION = 3600
+
+def similar(a, b):
+    """Calculate text similarity between two strings"""
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+def search_knowledge_base(user_query, context=None):
+    """
+    Enhanced knowledge base search with AI-powered relevance matching
+    Features:
+    1. Caching for performance
+    2. Multiple fallback strategies
+    3. Better error handling
+    4. Optimized AI prompt
+    5. Configurable thresholds
+    """
+    # Configuration
+    MIN_RELEVANCE_SCORE = 40  # Lowered threshold to capture more potential matches
+    MAX_RESULTS = 3
+    CACHE_TIMEOUT = 3600  # 1 hour cache
+    
+    # Try cache first if enabled
+    cache_key = f"kb_search_{user_query.lower().strip()}"
+    cached_results = cache.get(cache_key)
+    if cached_results:
+        return cached_results
+    
+    # Strategy 1: Semantic Search (Postgres vector search)
+    try:
+        vector = SearchVector('question', weight='A') + SearchVector('answer', weight='B')
+        query = SearchQuery(user_query)
+        
+        semantic_results = KnowledgeBaseEntry.objects.annotate(
+            search=vector,
+            rank=SearchRank(vector, query)
+        ).filter(search=query).order_by('-rank')[:MAX_RESULTS*2]  # Get extra for filtering
+        
+        if semantic_results.exists():
+            # Cache and return results
+            cache.set(cache_key, list(semantic_results), CACHE_TIMEOUT)
+            return semantic_results
+    except Exception as e:
+        pass  # Silently fall through to next strategy
+    
+    # Strategy 2: AI-Powered Matching
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        
+        # Get a representative sample if KB is large
+        all_entries = KnowledgeBaseEntry.objects.all()
+        if all_entries.count() > 100:
+            all_entries = all_entries.order_by('-last_accessed')[:100]  # Get most recently used
+        
+        # Optimized prompt for better matching
+        prompt = f"""
+        Analyze this university query and match to knowledge base entries.
+        Return JSON with: id (1-based index), relevance_score (0-100), match_reason.
+        Only include entries with score >= {MIN_RELEVANCE_SCORE}.
+        Prioritize: 1) Direct question matches 2) Answer content 3) Conceptual similarity.
+        
+        Query: "{user_query}"
+        
+        Knowledge Base:
+        {chr(10).join(f"{i+1}. Q: {e.question[:200]}{'...' if len(e.question)>200 else ''}{chr(10)}A: {e.answer[:200]}{'...' if len(e.answer)>200 else ''}" 
+                      for i, e in enumerate(all_entries))}
+        """
+        
+        response = model.generate_content(prompt)
+        matches = parse_gemini_response(response.text)
+        
+        if matches and isinstance(matches, list):
+            valid_matches = [m for m in matches if m.get('relevance_score', 0) >= MIN_RELEVANCE_SCORE]
+            valid_matches.sort(key=lambda x: x['relevance_score'], reverse=True)
+            
+            if valid_matches:
+                results = []
+                for match in valid_matches[:MAX_RESULTS]:
+                    try:
+                        entry = all_entries[match['id']-1]
+                        entry.last_accessed = timezone.now()  # Track usage
+                        entry.save()
+                        results.append(entry)
+                    except IndexError:
+                        continue
+                
+                if results:
+                    cache.set(cache_key, results, CACHE_TIMEOUT)
+                    return results
+    except Exception as e:
+        print(f"AI matching error: {e}")  # Consider proper logging
+    
+    # Strategy 3: Hybrid Fallback Search
+    try:
+        # Split query into meaningful words
+        words = [word for word in re.findall(r'\w+', user_query.lower()) if len(word) > 3]
+        
+        if words:
+            # Create a Q object for each word
+            queries = [Q(question__icontains=word) | Q(answer__icontains=word) for word in words]
+            
+            # Start with the first query
+            combined_query = queries.pop()
+            
+            # OR the remaining queries
+            for q in queries:
+                combined_query |= q
+            
+            fallback_results = KnowledgeBaseEntry.objects.filter(combined_query)[:MAX_RESULTS]
+            
+            if fallback_results.exists():
+                cache.set(cache_key, list(fallback_results), CACHE_TIMEOUT)
+                return fallback_results
+    except Exception as e:
+        pass
+    
+    # Final fallback: Empty result
+    return KnowledgeBaseEntry.objects.none()
 
 def get_client_ip(request):
     """Get the client's IP address from the request."""
@@ -65,11 +189,112 @@ def parse_gemini_response(response_text):
             "requires_followup": False
         }
 
+def generate_suggestions(intent_data, result_data):
+    """Generate suggested questions based on the intent and results."""
+    if not intent_data.get('requires_followup'):
+        return None
+    
+    suggestions = []
+    
+    if intent_data['intent'] == 'department_info':
+        if isinstance(result_data, list) and result_data:
+            suggestions = [
+                {"name": f"What courses are offered by {dept.get('name', 'this department')}?", "payload": f"courses_{dept.get('code', '')}"}
+                for dept in result_data[:2]  # Limit to 2 suggestions
+            ]
+    
+    elif intent_data['intent'] == 'faculty_info':
+        if isinstance(result_data, list) and result_data:
+            suggestions = [
+                {"name": f"What research does {fac.get('name', 'this professor')} specialize in?", "payload": f"research_{fac.get('email', '')}"}
+                for fac in result_data[:2]
+            ]
+    
+    elif intent_data['intent'] == 'program_info':
+        if isinstance(result_data, list) and result_data:
+            suggestions = [
+                {"name": f"What are the requirements for {prog.get('name', 'this program')}?", "payload": f"requirements_{prog.get('code', '')}"}
+                for prog in result_data[:2]
+            ]
+    
+    if suggestions:
+        return {
+            "type": "SUGGESTED_QUESTIONS",
+            "questions": suggestions
+        }
+    return None
+
+def format_response_data(intent_data, result_data, text_response):
+    """Format the response data according to the frontend interface."""
+    response_data = []
+    
+    # Always include the text response first
+    response_data.append({
+        "type": "text",
+        "content": text_response,
+        "meta": None
+    })
+    
+    # Add structured data based on intent
+    if intent_data['intent'] == 'program_info' and isinstance(result_data, list):
+        for program in result_data[:3]:  # Limit to 3 programs
+            response_data.append({
+                "type": "article",
+                "title": f"{program.get('name', 'Program')} Program",
+                "content": program.get('description', ''),
+                "link": f"/programs/{program.get('code', '')}",
+                "meta": {
+                    "degree": program.get('degree', ''),
+                    "credits": program.get('credits', '')
+                }
+            })
+    
+    elif intent_data['intent'] == 'course_info' and isinstance(result_data, list):
+        response_data.append({
+            "type": "options",
+            "title": "Related Courses",
+            "data": [
+                {
+                    "content": {"code": course.get('code', ''), "name": course.get('title', '')},
+                    "type": "course"
+                }
+                for course in result_data[:5]  # Limit to 5 courses
+            ],
+            "meta": None
+        })
+    
+    elif intent_data['intent'] == 'faculty_info' and isinstance(result_data, list):
+        for faculty in result_data[:3]:
+            response_data.append({
+                "type": "article",
+                "title": f"Professor {faculty.get('name', '')}",
+                "content": faculty.get('research', ''),
+                "link": f"/faculty/{faculty.get('email', '').split('@')[0] if faculty.get('email') else ''}",
+                "meta": {
+                    "department": faculty.get('department', ''),
+                    "title": faculty.get('title', '')
+                }
+            })
+    
+    # Format knowledge base results differently
+    elif isinstance(result_data, list) and result_data and isinstance(result_data[0], dict) and 'type' in result_data[0] and result_data[0]['type'] == 'knowledge_base':
+        for kb_entry in result_data:
+            response_data.append({
+                "type": "knowledge_base",
+                "title": kb_entry.get('question', '')[:100] + ("..." if len(kb_entry.get('question', '')) > 100 else ""),
+                "content": kb_entry.get('answer', ''),
+                "source": kb_entry.get('source', 'Troy University Knowledge Base'),
+                "meta": {
+                    "type": "knowledge_base_result"
+                }
+            })
+    
+    return response_data
+
 @api_view(['POST'])
 def university_assistant(request):
     """
-    Comprehensive university assistant endpoint that handles natural language queries
-    across all university data models and returns human-like responses with context.
+    University assistant endpoint that returns responses in the format expected by the frontend.
     """
     user_query = request.data.get('query', '').strip()
     if not user_query:
@@ -90,16 +315,13 @@ def university_assistant(request):
         
         # Step 1: Analyze intent and entities with context
         intent_prompt = f"""
-        Previous conversation context (for reference only):
-        {conversation_history}
-        
-        Analyze this new university-related query and respond with ONLY a JSON object containing:
+        Analyze this university-related query and respond with ONLY a JSON object containing:
         - "intent" (one of: department_info, faculty_info, student_info, program_info, 
                    course_info, enrollment_info, building_info, room_info, announcement, other)
-        - "entities" (a dictionary of relevant attributes including fields from database tables)
-        - "requires_followup" (boolean indicating if this question seems to need follow-up questions)
+        - "entities" (a dictionary of relevant attributes)
+        - "requires_followup" (boolean indicating if follow-up questions might be needed)
         
-        Query to analyze: "{user_query}"
+        Query: "{user_query}"
         """
         
         intent_response = model.generate_content(intent_prompt)
@@ -461,34 +683,54 @@ def university_assistant(request):
             }
             response_template = "Here's general information about the university:"
 
-        # Step 3: Generate natural language response with context
+
+        # Check knowledge base if no primary results found
+        if not result_data:
+            knowledge_results = search_knowledge_base(user_query, context)
+            if knowledge_results:
+                result_data = [{
+                    'question': kb.question,
+                    'answer': kb.answer,
+                    'source': kb.source or "Troy University Knowledge Base",
+                    'type': 'knowledge_base'
+                } for kb in knowledge_results]
+                response_template = "Here's some information that might help:"
+        
+        # If still no results, prepare a generic response
+        if not result_data:
+            result_data = {
+                'message': "I couldn't find specific information about your query.",
+                'suggestion': "You might want to contact the university directly or visit troy.edu for more information."
+            }
+            response_template = "I couldn't find specific information, but here are some general options:"
+        
+        # Step 3: Generate final response
         response_prompt = f"""
-        Conversation history for context:
-        {conversation_history}
-        
-        You are a helpful university assistant. The user asked: "{user_query}"
-        
-        Context: {response_template}
-        
-        Relevant Data (in JSON format):
-        {json.dumps(result_data, indent=2)}
-        
-        Additional user context that might be relevant:
-        {json.dumps(context['user_data'], indent=2)}
-        
-        Please generate a concise, friendly response that:
-        1. Directly answers the user's question
-        2. References previous context if relevant
-        3. Includes the most relevant information from the data
-        4. Formats the information clearly
-        5. If no results were found, politely explain this
-        6. For tabular data, present it in a structured format
-        7. If the intent suggests a follow-up might be needed, prompt the user appropriately
-        
-        Respond with just the plain text answer, without any JSON formatting or code blocks.
+You are a helpful assistant for Troy University in Alabama. The user asked: "{user_query}"
+
+Context: {response_template}
+
+Relevant Data (in JSON format):
+{json.dumps(result_data, indent=2)}
+
+Please generate a concise, friendly response that:
+1. First try to directly answer the user's question using the provided data
+2. If showing knowledge base results, indicate they're from our knowledge base
+3. For Troy University-specific information, focus on key aspects when relevant
+4. When appropriate, include that you're "Troy University's AI assistant"
+5. If appropriate, suggest contacting specific offices or visiting troy.edu
+6. Keep the response under 3-4 sentences if possible
+
+Respond with just the plain text answer.
         """
         
         final_response = model.generate_content(response_prompt)
+        
+        # Generate suggestions for follow-up questions
+        suggestions = generate_suggestions(intent_data, result_data)
+        
+        # Format the response data according to frontend requirements
+        formatted_data = format_response_data(intent_data, result_data, final_response.text)
         
         # Update conversation history
         context['conversation_history'].append({
@@ -499,30 +741,26 @@ def university_assistant(request):
         })
         update_user_context(ip_address, context)
 
-        context = {
-            
-             "query": user_query,
-             "data": [
-           {
-        "type": "text",
-        "content":final_response.text,
-        "meta": "",
-      }]
+        # Prepare the response in the exact format expected by frontend
+        response = {
+            "query": user_query,
+            "data": formatted_data,
+            "id": f"res_{datetime.now().timestamp()}",
+            "suggestions": [suggestions] if suggestions else None
         }
 
-        return Response(context, status=status.HTTP_200_OK)
-        # Uncomment the following lines to return the full response
-        
-        # return Response({
-        #     'query': user_query,
-        #     'intent': intent_data,
-        #     'data': result_data,
-        #     'response': final_response.text,
-        #     'session_id': ip_address  # Return the session identifier to the client
-        # })
+        return Response(response, status=status.HTTP_200_OK)
 
     except Exception as e:
-        return Response({
-            'error': str(e),
-            'message': 'An error occurred processing your request'
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        # Return error in the expected format
+        error_response = {
+            "query": user_query,
+            "data": [{
+                "type": "text",
+                "content": f"Sorry, an error occurred while processing your request: {str(e)}",
+                "meta": None
+            }],
+            "id": "error_response",
+            "suggestions": None
+        }
+        return Response(error_response, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
